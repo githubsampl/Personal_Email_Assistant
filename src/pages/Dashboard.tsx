@@ -1,351 +1,418 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import ReactMarkdown from 'react-markdown';
+import { 
+  Send, Sparkles, User, Bot, 
+  Terminal, RotateCcw,
+  MessageSquare, Loader2
+} from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
-import type { Email, Status } from '../store/useAppStore';
-import { Column } from '../components/Column';
-import { CheckCircle, Clock, XCircle, Megaphone, RefreshCw, Search, Download, CalendarDays, Filter } from 'lucide-react';
-import { SidePanel } from '../components/SidePanel';
-import { fetchLatestEmails, filterEmailsByKeywords } from '../services/gmailService';
-import { classifyEmailsInBatches } from '../services/claudeService';
+import { runAgentLoop } from '../services/agentService';
+import { EmailCard } from '../components/EmailCard';
+import { clsx, type ClassValue } from 'clsx';
+import { twMerge } from 'tailwind-merge';
 
-// Skeleton card for loading states
-const SkeletonCard: React.FC = () => (
-  <div className="bg-white dark:bg-gray-800 rounded-lg p-4 shadow-sm border border-gray-200 dark:border-gray-700 animate-pulse">
-    <div className="flex justify-between items-start mb-3">
-      <div className="h-4 bg-gray-200 dark:bg-gray-700 rounded w-3/4"></div>
-      <div className="h-5 bg-gray-200 dark:bg-gray-700 rounded w-16"></div>
-    </div>
-    <div className="flex items-center mb-3 space-x-2">
-      <div className="h-3 bg-gray-200 dark:bg-gray-700 rounded w-24"></div>
-      <div className="h-3 bg-gray-200 dark:bg-gray-700 rounded w-20"></div>
-    </div>
-    <div className="h-3 bg-gray-200 dark:bg-gray-700 rounded w-full mt-2"></div>
-    <div className="h-3 bg-gray-200 dark:bg-gray-700 rounded w-2/3 mt-1.5"></div>
-  </div>
-);
-
-// Skeleton column for loading states
-const SkeletonColumn: React.FC<{ title: string; colorClass: string; darkColorClass: string; icon: React.ReactNode }> = ({ title, colorClass, darkColorClass, icon }) => (
-  <div className="flex flex-col bg-gray-50 dark:bg-gray-800/50 rounded-xl h-full overflow-hidden border border-gray-200 dark:border-gray-700 transition-colors duration-200">
-    <div className={`p-4 ${colorClass} ${darkColorClass} flex justify-between items-center border-b border-gray-200/50 dark:border-gray-700/50`}>
-      <div className="flex items-center font-semibold text-gray-800 dark:text-gray-200">
-        {icon}
-        <span className="ml-2">{title}</span>
-      </div>
-      <div className="bg-white/50 dark:bg-gray-900/30 text-gray-700 dark:text-gray-300 px-2.5 py-0.5 rounded-full text-sm font-medium">
-        —
-      </div>
-    </div>
-    <div className="flex-1 p-3 space-y-3">
-      <SkeletonCard />
-      <SkeletonCard />
-    </div>
-  </div>
-);
-
-const STATUS_OPTIONS: { value: 'ALL' | Status; label: string; color: string }[] = [
-  { value: 'ALL', label: 'All Statuses', color: 'text-gray-500' },
-  { value: 'TO_REGISTER', label: 'To Register', color: 'text-indigo-600 dark:text-indigo-400' },
-  { value: 'APPROVED', label: 'Approved', color: 'text-green-600 dark:text-green-400' },
-  { value: 'WAITLISTED', label: 'Waitlisted', color: 'text-yellow-600 dark:text-yellow-400' },
-  { value: 'REJECTED', label: 'Rejected', color: 'text-red-600 dark:text-red-400' },
-];
+function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs));
+}
 
 export const Dashboard: React.FC = () => {
   const { 
-    emails, setEmails, isLoading, isClassifying, 
-    setLoading, setClassifying, accessToken, claudeApiKey, keywords,
-    visibleCategories
+    accessToken, chatHistory, addChatMessage, clearChat, chats, currentChatId
   } = useAppStore();
 
-  const [searchQuery, setSearchQuery] = useState('');
-  const [selectedEmail, setSelectedEmail] = useState<Email | null>(null);
-  const [syncProgress, setSyncProgress] = useState<{current: number, total: number} | null>(null);
-  const [dateFrom, setDateFrom] = useState('');
-  const [dateTo, setDateTo] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'ALL' | Status>('ALL');
+  const currentChatTitle = chats.find(c => c.id === currentChatId)?.title || "New Chat";
 
-  const handleSync = async () => {
-    if (!accessToken) {
-      alert("Please login first.");
+  const groqApiKey = import.meta.env.VITE_GROQ_API_KEY;
+
+  const [input, setInput] = useState('');
+  const [showClearedTooltip, setShowClearedTooltip] = useState(false);
+  const [isThinking, setIsThinking] = useState(false);
+  const [thought, setThought] = useState<string | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  const SUGGESTED_PROMPTS = [
+    "Which hackathons am I registered for?",
+    "Show me bank transaction emails",
+    "Any job interview calls this week?",
+    "Summarize my travel bookings",
+    "What urgent emails need my attention?"
+  ];
+
+  const [currentPromptIndex, setCurrentPromptIndex] = useState(0);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setCurrentPromptIndex((prev) => (prev + 1) % SUGGESTED_PROMPTS.length);
+    }, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [chatHistory, isThinking, thought]);
+
+  const handleSubmit = async (e?: React.FormEvent, overrideInput?: string) => {
+    e?.preventDefault();
+    const finalInput = overrideInput || input;
+    if (!finalInput.trim() || isThinking || !accessToken) return;
+
+    if (!groqApiKey) {
+      alert("Missing Groq API Key in .env file.");
       return;
     }
-    if (!claudeApiKey) {
-      alert("Please set your Gemini API Key in Settings first.");
-      return;
-    }
+
+    const userMsg = {
+      id: Date.now().toString(),
+      role: 'user' as const,
+      content: finalInput,
+      timestamp: new Date().toISOString()
+    };
+
+    addChatMessage(userMsg);
+    setInput('');
+    setIsThinking(true);
+    setThought(`Consulting Groq (Llama 3.3)...`);
 
     try {
-      setLoading(true);
-      
-      const rawEmails = await fetchLatestEmails(accessToken, 50);
-      
-      const existingIds = new Set(emails.map(e => e.id));
-      const newEmails = rawEmails.filter(e => !existingIds.has(e.id));
-      const relevantEmails = filterEmailsByKeywords(newEmails, keywords);
+      const response = await runAgentLoop({
+        apiKey: groqApiKey,
+        accessToken,
+        userQuery: finalInput,
+        history: chatHistory,
+        onProgress: (msg: string) => setThought(msg)
+      });
 
-      if (relevantEmails.length === 0) {
-        setLoading(false);
-        return;
-      }
+      const assistantMsg = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant' as const,
+        content: response.answer,
+        timestamp: new Date().toISOString(),
+        emails: response.emails,
+        isGreeting: response.isGreeting,
+        actionItems: response.actionItems,
+        keyFindings: response.keyFindings,
+        followUpOptions: response.followUpOptions,
+        classification: response.classification
+      };
 
-      setLoading(false);
-      setClassifying(true);
-      setSyncProgress({ current: 0, total: relevantEmails.length });
-
-      const classifiedEmails = await classifyEmailsInBatches(
-        claudeApiKey, 
-        relevantEmails,
-        (_batch, current, total) => {
-          setSyncProgress({ current, total });
-        }
-      );
-
-      setEmails([...classifiedEmails, ...emails]);
-      
-    } catch (error) {
+      addChatMessage(assistantMsg);
+    } catch (error: any) {
       console.error(error);
-      alert('Failed to sync emails. Check console.');
+      const errMsg = {
+        id: (Date.now() + 1).toString(),
+        role: 'assistant' as const,
+        content: `**Error:** ${error.message || "Failed to process query. Please check your API key and connection."}`,
+        timestamp: new Date().toISOString()
+      };
+      addChatMessage(errMsg);
     } finally {
-      setLoading(false);
-      setClassifying(false);
-      setSyncProgress(null);
+      setIsThinking(false);
+      setThought(null);
     }
   };
 
-  const handleExportCSV = () => {
-    if (emails.length === 0) return;
-    
-    const headers = ['Event Name', 'Status', 'Sender', 'Date', 'Event Date', 'Reason', 'Registration Link'];
-    const csvContent = [
-      headers.join(','),
-      ...emails.map(e => [
-        `"${(e.eventName || e.subject)?.replace(/"/g, '""')}"`,
-        e.status,
-        `"${e.senderName?.replace(/"/g, '""')}"`,
-        `"${new Date(e.dateReceived).toLocaleDateString()}"`,
-        `"${e.eventDate || ''}"`,
-        `"${e.reason?.replace(/"/g, '""') || ''}"`,
-        `"${e.registrationLink || ''}"`
-      ].join(','))
-    ].join('\n');
-
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = 'classified_emails.csv';
-    link.click();
+  const handleClearChat = () => {
+    clearChat();
+    setShowClearedTooltip(true);
+    setTimeout(() => setShowClearedTooltip(false), 2000);
   };
-
-  const filteredEmails = useMemo(() => {
-    let result = emails;
-    
-    // Search filter
-    if (searchQuery) {
-      const lowerQ = searchQuery.toLowerCase();
-      result = result.filter(e => 
-        e.subject.toLowerCase().includes(lowerQ) || 
-        e.senderName.toLowerCase().includes(lowerQ) ||
-        (e.eventName && e.eventName.toLowerCase().includes(lowerQ))
-      );
-    }
-    
-    // Status filter
-    if (statusFilter !== 'ALL') {
-      result = result.filter(e => e.status === statusFilter);
-    }
-    
-    // Date range filter
-    if (dateFrom) {
-      const from = new Date(dateFrom);
-      from.setHours(0, 0, 0, 0);
-      result = result.filter(e => new Date(e.dateReceived) >= from);
-    }
-    if (dateTo) {
-      const to = new Date(dateTo);
-      to.setHours(23, 59, 59, 999);
-      result = result.filter(e => new Date(e.dateReceived) <= to);
-    }
-    
-    return result;
-  }, [emails, searchQuery, statusFilter, dateFrom, dateTo]);
-
-  const toRegister = filteredEmails.filter(e => e.status === 'TO_REGISTER');
-  const approved = filteredEmails.filter(e => e.status === 'APPROVED');
-  const waitlisted = filteredEmails.filter(e => e.status === 'WAITLISTED');
-  const rejected = filteredEmails.filter(e => e.status === 'REJECTED');
-
-  const showSkeleton = isLoading && emails.length === 0;
-
-  // Count visible columns for responsive grid
-  const visibleCount = [visibleCategories.TO_REGISTER, visibleCategories.APPROVED, visibleCategories.WAITLISTED, visibleCategories.REJECTED].filter(Boolean).length;
-  const gridCols = visibleCount <= 2 ? `md:grid-cols-${visibleCount}` : visibleCount === 3 ? 'md:grid-cols-3' : 'md:grid-cols-4';
 
   return (
-    <div className="h-[calc(100vh-8rem)] flex flex-col">
-      {/* Top Actions */}
-      <div className="mb-4 flex flex-col lg:flex-row justify-between items-start lg:items-center space-y-3 lg:space-y-0">
-        
-        <div className="flex items-center space-x-2 w-full lg:w-auto flex-wrap gap-y-2">
-          {/* Search */}
-          <div className="relative flex-1 lg:w-56 min-w-[180px]">
-            <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-              <Search className="h-4 w-4 text-gray-400" />
-            </div>
-            <input
-              type="text"
-              className="block w-full pl-10 pr-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg leading-5 bg-white dark:bg-gray-800 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 sm:text-sm transition-colors"
-              placeholder="Search events or senders..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-            />
-          </div>
-
-          {/* Status Filter */}
-          <div className="relative min-w-[140px]">
-            <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
-              <Filter className="h-4 w-4 text-gray-400" />
-            </div>
-            <select
-              value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value as 'ALL' | Status)}
-              className="block w-full pl-9 pr-8 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white sm:text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-colors appearance-none cursor-pointer"
+    <div className="flex flex-col h-full bg-white dark:bg-gray-950 items-stretch relative">
+      
+      {/* Main Chat Header */}
+      {chatHistory.length > 0 && (
+        <div className="sticky top-0 z-10 bg-white/90 dark:bg-gray-950/90 backdrop-blur-md border-b border-gray-100 dark:border-gray-800/50 px-6 py-3 flex items-center justify-between">
+          <span className="text-sm font-semibold text-gray-800 dark:text-gray-200 truncate pr-4">
+            {currentChatTitle}
+          </span>
+          <div className="relative flex-shrink-0">
+            <button
+              onClick={handleClearChat}
+              className="p-2 text-gray-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/10 rounded-xl transition-all"
+              title="Clear Chat"
             >
-              {STATUS_OPTIONS.map(opt => (
-                <option key={opt.value} value={opt.value}>{opt.label}</option>
-              ))}
-            </select>
+              <RotateCcw className="w-4 h-4" />
+            </button>
+            
+            <AnimatePresence>
+              {showClearedTooltip && (
+                <motion.div 
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, scale: 0.9 }}
+                  className="absolute right-0 top-full mt-2 px-3 py-1.5 bg-gray-900 dark:bg-gray-100 text-white dark:text-gray-900 text-xs font-medium rounded-lg shadow-xl whitespace-nowrap pointer-events-none"
+                >
+                  Chat cleared
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
+        </div>
+      )}
 
-          {/* Date Range Filter */}
-          <div className="hidden xl:flex items-center space-x-2">
-            <CalendarDays className="h-4 w-4 text-gray-400 flex-shrink-0" />
-            <input
-              type="date"
-              className="block w-36 px-2 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white sm:text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-colors"
-              value={dateFrom}
-              onChange={(e) => setDateFrom(e.target.value)}
-              title="Filter from date"
-            />
-            <span className="text-gray-400 text-sm">to</span>
-            <input
-              type="date"
-              className="block w-36 px-2 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white sm:text-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 transition-colors"
-              value={dateTo}
-              onChange={(e) => setDateTo(e.target.value)}
-              title="Filter to date"
-            />
-            {(dateFrom || dateTo) && (
-              <button
-                onClick={() => { setDateFrom(''); setDateTo(''); }}
-                className="text-xs text-blue-600 dark:text-blue-400 hover:underline whitespace-nowrap"
+      {/* Messages Area */}
+      <div 
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto px-4 sm:px-8 space-y-8 pb-10 pt-6 scroll-smooth scrollbar-thin scrollbar-thumb-gray-200 dark:scrollbar-thumb-gray-800"
+      >
+        {!groqApiKey ? (
+          <div className="h-full flex flex-col items-center justify-center text-center space-y-6">
+            <motion.div 
+              initial={{ scale: 0.8, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              className="w-16 h-16 rounded-3xl bg-yellow-500 flex items-center justify-center text-white shadow-xl"
+            >
+              <Terminal className="w-8 h-8" />
+            </motion.div>
+            <div className="space-y-4 max-w-md">
+              <h2 className="text-2xl font-bold text-gray-900 dark:text-white">API Key Required</h2>
+              <div className="p-4 bg-yellow-50 dark:bg-yellow-900/20 text-yellow-800 dark:text-yellow-200 rounded-2xl text-sm border border-yellow-200 dark:border-yellow-900/50">
+                <p className="font-semibold mb-2">Please add your Groq API key to the .env file and restart.</p>
+                <div className="font-mono text-xs bg-white dark:bg-black/50 p-2 rounded-lg mt-2 overflow-x-auto text-left">
+                  VITE_GROQ_API_KEY=your_key_here
+                </div>
+              </div>
+              <a 
+                href="https://console.groq.com/keys" 
+                target="_blank" 
+                rel="noreferrer"
+                className="inline-block text-blue-600 dark:text-blue-400 hover:underline text-sm font-medium"
               >
-                Clear
-              </button>
-            )}
+                Get a free key from Groq Console &rarr;
+              </a>
+            </div>
           </div>
-        </div>
+        ) : chatHistory.length === 0 ? (
+          <div className="h-full flex flex-col items-center justify-center text-center space-y-6">
+            <motion.div 
+              initial={{ scale: 0.8, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              className="w-16 h-16 rounded-3xl bg-blue-600 flex items-center justify-center text-white shadow-2xl"
+            >
+              <Sparkles className="w-8 h-8" />
+            </motion.div>
+            <div className="space-y-2">
+              <h2 className="text-2xl font-bold text-gray-900 dark:text-white">How can I help you today?</h2>
+              <p className="text-gray-500 dark:text-gray-400 max-w-sm mx-auto text-sm">
+                I'm Antigravity, your autonomous AI assistant powered by Groq. Ask me anything about your emails.
+              </p>
+            </div>
+          </div>
+        ) : null}
 
-        <div className="flex space-x-3 w-full lg:w-auto flex-shrink-0">
-          <button
-            onClick={handleExportCSV}
-            className="inline-flex items-center px-4 py-2 border border-gray-300 dark:border-gray-600 shadow-sm text-sm font-medium rounded-lg text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-800 hover:bg-gray-50 dark:hover:bg-gray-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors"
-          >
-            <Download className="h-4 w-4 mr-2" />
-            <span className="hidden sm:inline">Export CSV</span>
-          </button>
-          
-          <button
-            onClick={handleSync}
-            disabled={isLoading || isClassifying}
-            className="inline-flex flex-1 lg:flex-none justify-center items-center px-4 py-2 border border-transparent shadow-sm text-sm font-medium rounded-lg text-white bg-blue-600 hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-75 transition-colors"
-          >
-            <RefreshCw className={`h-4 w-4 mr-2 ${(isLoading || isClassifying) ? 'animate-spin' : ''}`} />
-            {isLoading ? 'Fetching...' : isClassifying ? `Classifying ${syncProgress?.current || 0}/${syncProgress?.total || 0}...` : 'Sync New'}
-          </button>
-        </div>
+        <AnimatePresence mode="popLayout">
+          {chatHistory.map((msg) => (
+            <motion.div
+              key={msg.id}
+              initial={{ opacity: 0, y: 10 }}
+              animate={{ opacity: 1, y: 0 }}
+              className={cn(
+                "flex w-full",
+                msg.role === 'user' ? "justify-end" : "justify-start"
+              )}
+            >
+              <div className={cn(
+                "flex items-start max-w-[90%] md:max-w-[80%] space-x-4",
+                msg.role === 'user' && "flex-row-reverse space-x-reverse"
+              )}>
+                <div className={cn(
+                  "w-8 h-8 rounded-full flex-shrink-0 flex items-center justify-center shadow-sm",
+                  msg.role === 'user' ? "bg-blue-600 text-white" : "bg-gray-800 dark:bg-v-gray-700 text-white"
+                )}>
+                  {msg.role === 'user' ? <User className="w-4 h-4" /> : <Bot className="w-4 h-4" />}
+                </div>
+
+                <div className="space-y-3 flex-1 min-w-0">
+                  <div className={cn(
+                    "rounded-2xl px-5 py-4 text-sm leading-relaxed shadow-sm",
+                    msg.role === 'user' 
+                      ? "bg-blue-600 text-white rounded-tr-none" 
+                      : "bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 text-gray-800 dark:text-gray-200 rounded-tl-none prose prose-sm dark:prose-invert max-w-none"
+                  )}>
+                    {msg.role === 'assistant' ? (
+                      <div className="space-y-4">
+                        <ReactMarkdown>{msg.content}</ReactMarkdown>
+                        
+                        {msg.keyFindings && msg.keyFindings.length > 0 && (
+                          <div className="mt-4 bg-blue-50/50 dark:bg-blue-900/10 border border-blue-100 dark:border-blue-900/30 p-4 rounded-xl">
+                            <h4 className="text-[11px] font-bold text-blue-800 dark:text-blue-300 uppercase tracking-widest mb-2">Key Findings</h4>
+                            <ul className="space-y-1.5">
+                              {msg.keyFindings.map((kf, i) => (
+                                <li key={i} className="text-sm text-gray-700 dark:text-gray-300 flex items-start">
+                                  <span className="mr-2 mt-0.5 opacity-50">•</span>
+                                  <span>{kf}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+
+                        {msg.actionItems && msg.actionItems.length > 0 && (
+                          <div className="mt-4 bg-yellow-50/50 dark:bg-yellow-900/10 border border-yellow-100 dark:border-yellow-900/30 p-4 rounded-xl">
+                            <h4 className="text-[11px] font-bold text-yellow-800 dark:text-yellow-300 flex items-center mb-2 uppercase tracking-widest">
+                              <span className="mr-1.5">⚡</span> Action Required
+                            </h4>
+                            <ul className="space-y-1.5">
+                              {msg.actionItems.map((ai, i) => (
+                                <li key={i} className="text-sm text-gray-700 dark:text-gray-300 flex items-start">
+                                  <span className="mr-2 mt-0.5 opacity-50">•</span>
+                                  <span>{ai}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <p>{msg.content}</p>
+                    )}
+                  </div>
+
+                  {msg.thought && (
+                    <div className="flex items-start space-x-2 text-[10px] text-gray-400 font-mono italic px-2 bg-gray-50 dark:bg-gray-950/50 py-2 rounded-lg border border-gray-100 dark:border-gray-900">
+                      <Terminal className="w-3 h-3 mt-0.5 flex-shrink-0" />
+                      <span>{msg.thought}</span>
+                    </div>
+                  )}
+
+                  {msg.classification && Object.keys(msg.classification).length > 0 && (
+                    <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                      {Object.entries(msg.classification).map(([status, items]) => (
+                        Array.isArray(items) && items.length > 0 && (
+                          <div key={status} className="bg-white dark:bg-gray-900 rounded-xl p-3 border border-gray-100 dark:border-gray-800 shadow-sm">
+                            <h4 className="text-[11px] font-bold text-gray-800 dark:text-gray-200 uppercase tracking-wider mb-2 flex items-center">
+                              {status.toLowerCase() === 'approved' ? '✅ ' : ''}
+                              {status.toLowerCase() === 'waitlisted' ? '⏳ ' : ''}
+                              {status.toLowerCase() === 'pending' ? '⏳ ' : ''}
+                              {status.toLowerCase() === 'rejected' ? '❌ ' : ''}
+                              {status} ({items.length})
+                            </h4>
+                            <ul className="space-y-1.5">
+                              {items.map((item: any, i: number) => (
+                                <li key={i} className="text-[11px] text-gray-500 dark:text-gray-400 leading-tight">
+                                  <span className="mr-1.5 inline-block text-gray-300">•</span>
+                                  <span>{typeof item === 'string' ? item : item?.subject || item?.name || JSON.stringify(item)}</span>
+                                </li>
+                              ))}
+                            </ul>
+                          </div>
+                        )
+                      ))}
+                    </div>
+                  )}
+
+                  {msg.emails && msg.emails.length > 0 && (
+                    <div className="mt-4 grid grid-cols-1 gap-1">
+                      {msg.emails.map((email) => (
+                        <EmailCard key={email.id} email={email} />
+                      ))}
+                    </div>
+                  )}
+
+                  {msg.followUpOptions && msg.followUpOptions.length > 0 && (
+                    <div className="mt-3 flex flex-wrap gap-2 pt-2">
+                      {msg.followUpOptions.map((opt, i) => (
+                        <button
+                          key={i}
+                          onClick={() => handleSubmit(undefined, opt)}
+                          className="px-4 py-2 bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 hover:border-blue-500 hover:text-blue-600 dark:hover:text-blue-400 rounded-2xl text-xs font-semibold text-gray-700 dark:text-gray-300 transition-colors shadow-sm active:scale-95"
+                        >
+                          {opt}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </motion.div>
+          ))}
+
+          {isThinking && (
+            <motion.div 
+              initial={{ opacity: 0, y: 10 }} 
+              animate={{ opacity: 1, y: 0 }}
+              className="flex justify-start space-x-4"
+            >
+              <div className="w-8 h-8 rounded-full bg-gray-800 text-white flex items-center justify-center">
+                <Bot className="w-4 h-4" />
+              </div>
+              <div className="space-y-3 flex-1">
+                <div className="bg-white dark:bg-gray-900 border border-gray-100 dark:border-gray-800 px-5 py-4 rounded-2xl rounded-tl-none shadow-sm flex items-center space-x-3">
+                  <Loader2 className="w-4 h-4 text-blue-500 animate-spin" />
+                  <span className="text-sm text-gray-500 animate-pulse">
+                    {thought || "Processing..."}
+                  </span>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
 
-      {/* Progress Bar */}
-      {isClassifying && syncProgress && (
-        <div className="mb-4">
-          <div className="flex justify-between text-xs text-blue-600 dark:text-blue-400 mb-1 font-medium">
-            <span>Classifying new emails...</span>
-            <span>{Math.round((syncProgress.current / syncProgress.total) * 100)}%</span>
-          </div>
-          <div className="w-full bg-blue-100 dark:bg-blue-900/30 rounded-full h-1.5">
-            <div 
-              className="bg-blue-600 dark:bg-blue-400 h-1.5 rounded-full transition-all duration-300"
-              style={{ width: `${(syncProgress.current / syncProgress.total) * 100}%` }}
-            ></div>
-          </div>
+      {/* Input Area */}
+      <div className="sticky bottom-0 pb-6 px-4 space-y-4">
+        <div className="max-w-3xl mx-auto overflow-hidden h-10 flex items-center justify-center">
+           <AnimatePresence mode="wait">
+             <motion.button
+               key={currentPromptIndex}
+               initial={{ y: 20, opacity: 0 }}
+               animate={{ y: 0, opacity: 1 }}
+               exit={{ y: -20, opacity: 0 }}
+               onClick={() => handleSubmit(undefined, SUGGESTED_PROMPTS[currentPromptIndex])}
+               className="text-xs text-blue-600 dark:text-blue-400 font-medium hover:underline flex items-center space-x-2"
+             >
+               <Sparkles className="w-3 h-3" />
+               <span>Try: "{SUGGESTED_PROMPTS[currentPromptIndex]}"</span>
+             </motion.button>
+           </AnimatePresence>
         </div>
-      )}
 
-      {/* Kanban Board */}
-      <div className={`flex-1 grid grid-cols-1 ${gridCols} gap-4 overflow-hidden pb-4`}>
-        {showSkeleton ? (
-          <>
-            <SkeletonColumn title="To Register" colorClass="bg-indigo-50" darkColorClass="dark:bg-indigo-900/20" icon={<Megaphone className="w-5 h-5 text-indigo-600 dark:text-indigo-400" />} />
-            <SkeletonColumn title="Approved" colorClass="bg-green-50" darkColorClass="dark:bg-green-900/20" icon={<CheckCircle className="w-5 h-5 text-green-600 dark:text-green-400" />} />
-            <SkeletonColumn title="Waitlisted / Pending" colorClass="bg-yellow-50" darkColorClass="dark:bg-yellow-900/20" icon={<Clock className="w-5 h-5 text-yellow-600 dark:text-yellow-400" />} />
-            <SkeletonColumn title="Rejected" colorClass="bg-red-50" darkColorClass="dark:bg-red-900/20" icon={<XCircle className="w-5 h-5 text-red-600 dark:text-red-400" />} />
-          </>
-        ) : (
-          <>
-            {visibleCategories.TO_REGISTER && (
-              <Column 
-                title="To Register" 
-                status="TO_REGISTER" 
-                emails={toRegister} 
-                colorClass="bg-indigo-50"
-                darkColorClass="dark:bg-indigo-900/20"
-                icon={<Megaphone className="w-5 h-5 text-indigo-600 dark:text-indigo-400" />}
-                onCardClick={setSelectedEmail}
-              />
-            )}
-            {visibleCategories.APPROVED && (
-              <Column 
-                title="Approved" 
-                status="APPROVED" 
-                emails={approved} 
-                colorClass="bg-green-50"
-                darkColorClass="dark:bg-green-900/20"
-                icon={<CheckCircle className="w-5 h-5 text-green-600 dark:text-green-400" />}
-                onCardClick={setSelectedEmail}
-              />
-            )}
-            {visibleCategories.WAITLISTED && (
-              <Column 
-                title="Waitlisted / Pending" 
-                status="WAITLISTED" 
-                emails={waitlisted} 
-                colorClass="bg-yellow-50"
-                darkColorClass="dark:bg-yellow-900/20"
-                icon={<Clock className="w-5 h-5 text-yellow-600 dark:text-yellow-400" />}
-                onCardClick={setSelectedEmail}
-              />
-            )}
-            {visibleCategories.REJECTED && (
-              <Column 
-                title="Rejected" 
-                status="REJECTED" 
-                emails={rejected} 
-                colorClass="bg-red-50"
-                darkColorClass="dark:bg-red-900/20"
-                icon={<XCircle className="w-5 h-5 text-red-600 dark:text-red-400" />}
-                onCardClick={setSelectedEmail}
-              />
-            )}
-          </>
-        )}
+        <form 
+          onSubmit={handleSubmit}
+          className="relative max-w-4xl mx-auto group shadow-2xl rounded-3xl overflow-hidden"
+        >
+          <div className="absolute inset-y-0 left-0 pl-5 flex items-center pointer-events-none">
+            <MessageSquare className="w-5 h-5 text-gray-400 group-focus-within:text-blue-500 transition-colors" />
+          </div>
+          <input
+            type="text"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            disabled={isThinking}
+            placeholder="Ask anything about your emails..."
+            className="block w-full pl-14 pr-24 py-5 bg-white dark:bg-gray-900/50 border border-gray-100 dark:border-gray-800 focus:border-blue-500 text-gray-900 dark:text-white placeholder-gray-500 text-sm focus:ring-0 transition-all outline-none"
+          />
+          <div className="absolute inset-y-0 right-3 flex items-center space-x-2">
+            <button
+              type="submit"
+              disabled={!input.trim() || isThinking}
+
+              className={cn(
+                "flex items-center space-x-2 px-5 py-2.5 rounded-2xl font-bold text-sm transition-all",
+                input.trim() && !isThinking
+                  ? "bg-blue-600 text-white shadow-lg hover:bg-blue-700"
+                  : "bg-gray-100 dark:bg-gray-800 text-gray-400 cursor-not-allowed"
+              )}
+            >
+              <span>Send</span>
+              <Send className="w-4 h-4" />
+            </button>
+          </div>
+        </form>
+        
+        <div className="flex items-center justify-center space-x-4 text-[10px] text-gray-400">
+           <div className="flex items-center">
+             <div className="w-2 h-2 rounded-full bg-green-500 mr-2" />
+             Gmail API Connected
+           </div>
+           <div className="w-1 h-1 rounded-full bg-gray-600" />
+           <span>Groq AI Brain</span>
+        </div>
       </div>
-
-      {selectedEmail && (
-        <SidePanel 
-          email={selectedEmail} 
-          onClose={() => setSelectedEmail(null)} 
-        />
-      )}
     </div>
   );
 };

@@ -1,41 +1,61 @@
 import { extractEmailDetails } from '../utils/emailParser';
 
-export const fetchLatestEmails = async (token: string, maxResults = 50) => {
+export const fetchEmailMetadata = async (token: string, maxResults = 5, query = '') => {
   try {
-    // 1. Fetch message IDs
-    const response = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=${maxResults}`, {
-      headers: {
-        Authorization: `Bearer ${token}`
-      }
+    const url = new URL('https://gmail.googleapis.com/gmail/v1/users/me/messages');
+    url.searchParams.append('maxResults', maxResults.toString());
+    if (query) url.searchParams.append('q', query);
+
+    const response = await fetch(url.toString(), {
+      headers: { Authorization: `Bearer ${token}` }
     });
 
-    if (!response.ok) {
-      if (response.status === 401) {
-        throw new Error('UNAUTHORIZED');
-      }
-      throw new Error('Failed to fetch messages');
-    }
+    if (!response.ok) throw new Error(response.status === 401 ? 'UNAUTHORIZED' : 'Failed to fetch message list');
 
     const data = await response.json();
     const messages = data.messages || [];
 
-    // 2. Fetch full details for each message
+    // Fetch only metadata (keeps it extremely light)
     const emailPromises = messages.map(async (msg: any) => {
-      const msgRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`, {
-        headers: {
-          Authorization: `Bearer ${token}`
-        }
+      const msgRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date`, {
+        headers: { Authorization: `Bearer ${token}` }
       });
       if (!msgRes.ok) return null;
       const msgData = await msgRes.json();
-      return extractEmailDetails(msgData);
+      return extractEmailDetails(msgData); // Body will naturally be empty, snippet will exist
     });
 
-    const fullEmails = (await Promise.all(emailPromises)).filter(Boolean);
-    return fullEmails;
-
+    return (await Promise.all(emailPromises)).filter(Boolean);
   } catch (error) {
-    console.error('Error fetching emails:', error);
+    console.error('Error fetching email metadata:', error);
+    throw error;
+  }
+};
+
+export const readFullEmails = async (token: string, ids: string[]) => {
+  try {
+    const emailPromises = ids.map(async (id) => {
+      const msgRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!msgRes.ok) return null;
+      const msgData = await msgRes.json();
+      
+      const parsed = extractEmailDetails(msgData);
+      
+      // Additional safety strip for residual HTML and limit to 800 chars
+      const cleanBody = parsed.body
+        .replace(/<[^>]+>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .substring(0, 800);
+        
+      return { ...parsed, body: cleanBody };
+    });
+
+    return (await Promise.all(emailPromises)).filter(Boolean);
+  } catch (error) {
+    console.error('Error reading full emails:', error);
     throw error;
   }
 };

@@ -1,7 +1,5 @@
 import { create } from 'zustand';
 
-export type Status = 'TO_REGISTER' | 'APPROVED' | 'WAITLISTED' | 'REJECTED' | 'UNCLASSIFIED';
-
 export interface Email {
   id: string;
   subject: string;
@@ -9,14 +7,41 @@ export interface Email {
   senderEmail: string;
   dateReceived: string;
   body: string;
+  snippet?: string;
   
-  // Classification fields
-  eventName?: string | null;
-  eventDate?: string | null;
-  status: Status;
-  reason?: string;
-  actionRequired?: boolean;
-  registrationLink?: string | null;
+  // Dynamic AI Classification (Context-aware)
+  category?: string;
+  aiSummary?: string;
+  importantDetail?: string;
+  urgency?: string;
+  status?: string;
+}
+
+export interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: string;
+  emails?: Email[];
+  thought?: string;
+  isGreeting?: boolean;
+  actionItems?: string[];
+  keyFindings?: string[];
+  followUpOptions?: string[];
+  classification?: {
+    approved?: string[];
+    waitlisted?: string[];
+    rejected?: string[];
+    [key: string]: any;
+  };
+}
+
+export interface ChatSession {
+  id: string;
+  title: string;
+  messages: ChatMessage[];
+  createdAt: string;
+  updatedAt: string;
 }
 
 interface AppState {
@@ -26,91 +51,125 @@ interface AppState {
   userProfile: { name: string; email: string; picture: string } | null;
   
   // Settings
-  claudeApiKey: string;
-  keywords: string[];
   darkMode: boolean;
-  visibleCategories: { TO_REGISTER: boolean; APPROVED: boolean; WAITLISTED: boolean; REJECTED: boolean };
   
   // Data
-  emails: Email[];
+  chats: ChatSession[];
+  currentChatId: string | null;
+  chatHistory: ChatMessage[];
   isLoading: boolean;
-  isClassifying: boolean;
   
   // Actions
   setAuth: (token: string, profile: any) => void;
   logout: () => void;
-  setClaudeApiKey: (key: string) => void;
-  setKeywords: (keywords: string[]) => void;
-  setEmails: (emails: Email[]) => void;
-  updateEmail: (id: string, updates: Partial<Email>) => void;
-  removeEmail: (id: string) => void;
+  addChatMessage: (msg: ChatMessage) => void;
+  clearChat: () => void;
+  createNewChat: () => void;
+  loadChat: (id: string) => void;
+  deleteChat: (id: string) => void;
   setLoading: (loading: boolean) => void;
-  setClassifying: (classifying: boolean) => void;
   toggleDarkMode: () => void;
-  setVisibleCategories: (categories: { TO_REGISTER: boolean; APPROVED: boolean; WAITLISTED: boolean; REJECTED: boolean }) => void;
 }
 
-// Load initial state from localStorage if available
-const savedApiKey = localStorage.getItem('claudeApiKey') || '';
-const savedKeywords = JSON.parse(localStorage.getItem('keywords') || '["registration", "application", "event", "waitlist", "confirmed", "rejected", "selected", "not selected", "congratulations", "unfortunately", "register now", "apply now", "submit", "invitation", "invite", "hackathon", "workshop", "conference", "meetup"]');
-const savedEmails = JSON.parse(localStorage.getItem('emails') || '[]');
+const savedChats = JSON.parse(localStorage.getItem('antigravity_chats') || '[]');
 const savedDarkMode = localStorage.getItem('darkMode') === 'true';
-const savedCategories = JSON.parse(localStorage.getItem('visibleCategories') || '{"TO_REGISTER":true,"APPROVED":true,"WAITLISTED":true,"REJECTED":true}');
 
-// Apply dark mode class on load
 if (savedDarkMode) {
   document.documentElement.classList.add('dark');
 }
+
+// User requested: "Every time the app loads/refreshes, automatically start a fresh empty chat"
+// We do NOT load `antigravity_current_chat_id` here on purpose.
 
 export const useAppStore = create<AppState>((set) => ({
   isAuthenticated: false,
   accessToken: null,
   userProfile: null,
   
-  claudeApiKey: savedApiKey,
-  keywords: savedKeywords,
   darkMode: savedDarkMode,
-  visibleCategories: savedCategories,
   
-  emails: savedEmails,
+  chats: savedChats,
+  currentChatId: null,
+  chatHistory: [], // starts empty
   isLoading: false,
-  isClassifying: false,
   
   setAuth: (token, profile) => set({ isAuthenticated: true, accessToken: token, userProfile: profile }),
   logout: () => {
-    localStorage.removeItem('emails');
-    set({ isAuthenticated: false, accessToken: null, userProfile: null, emails: [] });
+    localStorage.removeItem('antigravity_chats');
+    localStorage.removeItem('antigravity_current_chat_id');
+    set({ isAuthenticated: false, accessToken: null, userProfile: null, chats: [], currentChatId: null, chatHistory: [] });
   },
   
-  setClaudeApiKey: (key) => {
-    localStorage.setItem('claudeApiKey', key);
-    set({ claudeApiKey: key });
-  },
-  
-  setKeywords: (keywords) => {
-    localStorage.setItem('keywords', JSON.stringify(keywords));
-    set({ keywords });
-  },
-  
-  setEmails: (emails) => {
-    localStorage.setItem('emails', JSON.stringify(emails));
-    set({ emails });
-  },
-  
-  updateEmail: (id, updates) => set((state) => {
-    const newEmails = state.emails.map(email => email.id === id ? { ...email, ...updates } : email);
-    localStorage.setItem('emails', JSON.stringify(newEmails));
-    return { emails: newEmails };
+  addChatMessage: (msg) => set((state) => {
+    let currentId = state.currentChatId;
+    let newChats = [...state.chats];
+    const now = new Date().toISOString();
+
+    if (!currentId) {
+      currentId = Date.now().toString();
+      const newSession: ChatSession = {
+        id: currentId,
+        title: msg.content.substring(0, 40) + (msg.content.length > 40 ? '...' : ''),
+        messages: [msg],
+        createdAt: now,
+        updatedAt: now
+      };
+      newChats.unshift(newSession); // Add to top
+    } else {
+      const chatIndex = newChats.findIndex(c => c.id === currentId);
+      if (chatIndex >= 0) {
+        newChats[chatIndex] = {
+          ...newChats[chatIndex],
+          messages: [...newChats[chatIndex].messages, msg],
+          updatedAt: now
+        };
+      }
+    }
+
+    if (newChats.length > 50) {
+      newChats = newChats.slice(0, 50);
+    }
+
+    localStorage.setItem('antigravity_chats', JSON.stringify(newChats));
+    localStorage.setItem('antigravity_current_chat_id', currentId);
+    
+    const activeMessages = newChats.find(c => c.id === currentId)?.messages || [];
+    return { chats: newChats, currentChatId: currentId, chatHistory: activeMessages };
   }),
   
-  removeEmail: (id) => set((state) => {
-    const newEmails = state.emails.filter(email => email.id !== id);
-    localStorage.setItem('emails', JSON.stringify(newEmails));
-    return { emails: newEmails };
+  clearChat: () => set((state) => {
+    if (state.currentChatId) {
+      const newChats = state.chats.filter(c => c.id !== state.currentChatId);
+      localStorage.setItem('antigravity_chats', JSON.stringify(newChats));
+      localStorage.removeItem('antigravity_current_chat_id');
+      return { chats: newChats, currentChatId: null, chatHistory: [] };
+    }
+    return state;
+  }),
+
+  createNewChat: () => set(() => {
+    localStorage.removeItem('antigravity_current_chat_id');
+    return { currentChatId: null, chatHistory: [] };
+  }),
+
+  loadChat: (id) => set((state) => {
+    const chat = state.chats.find(c => c.id === id);
+    if (!chat) return state;
+    localStorage.setItem('antigravity_current_chat_id', id);
+    return { currentChatId: id, chatHistory: chat.messages };
+  }),
+
+  deleteChat: (id) => set((state) => {
+    const newChats = state.chats.filter(c => c.id !== id);
+    localStorage.setItem('antigravity_chats', JSON.stringify(newChats));
+    if (state.currentChatId === id) {
+      localStorage.removeItem('antigravity_current_chat_id');
+      return { chats: newChats, currentChatId: null, chatHistory: [] };
+    }
+    return { chats: newChats };
   }),
   
   setLoading: (loading) => set({ isLoading: loading }),
-  setClassifying: (classifying) => set({ isClassifying: classifying }),
   
   toggleDarkMode: () => set((state) => {
     const newMode = !state.darkMode;
@@ -122,9 +181,4 @@ export const useAppStore = create<AppState>((set) => ({
     }
     return { darkMode: newMode };
   }),
-  
-  setVisibleCategories: (categories) => {
-    localStorage.setItem('visibleCategories', JSON.stringify(categories));
-    set({ visibleCategories: categories });
-  },
 }));

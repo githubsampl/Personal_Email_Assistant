@@ -39,8 +39,8 @@ export const extractEmailDetails = (message: any) => {
         if (part.mimeType === 'text/html') {
           // crude html to text
           const html = getBody(part);
-          return html.replace(/<style[^>]*>.*<\/style>/gm, '')
-                     .replace(/<script[^>]*>.*<\/script>/gm, '')
+          return html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+                     .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
                      .replace(/<[^>]+>/g, ' ')
                      .replace(/\s+/g, ' ')
                      .trim();
