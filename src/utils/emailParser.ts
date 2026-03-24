@@ -21,41 +21,57 @@ export const extractEmailDetails = (message: any) => {
   
   // Extract body
   let body = '';
-  
+
+  const htmlToText = (html: string): string =>
+    html
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/&lt;/gi, '<')
+      .replace(/&gt;/gi, '>')
+      .replace(/&quot;/gi, '"')
+      .replace(/\s+/g, ' ')
+      .trim();
+
   const getBody = (payload: any): string => {
+    // If this payload has inline body data, decode and strip HTML if needed
     if (payload.body && payload.body.data) {
-      return atob(payload.body.data.replace(/-/g, '+').replace(/_/g, '/'));
+      const raw = atob(payload.body.data.replace(/-/g, '+').replace(/_/g, '/'));
+      // If the MIME type for this part is HTML, strip it to plain text
+      if (payload.mimeType === 'text/html') {
+        return htmlToText(raw);
+      }
+      return raw;
     }
-    
+
     if (payload.parts && payload.parts.length > 0) {
+      // 1. Prefer plain text
       for (const part of payload.parts) {
         if (part.mimeType === 'text/plain') {
-          return getBody(part);
+          const content = getBody(part);
+          if (content) return content;
         }
       }
-      
-      // Fallback to HTML if plain text not found
-      for (const part of payload.parts) {
-        if (part.mimeType === 'text/html') {
-          // crude html to text
-          const html = getBody(part);
-          return html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-                     .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-                     .replace(/<[^>]+>/g, ' ')
-                     .replace(/\s+/g, ' ')
-                     .trim();
-        }
-      }
-      
-      // Recurse into multipart
+
+      // 2. Recurse into nested multipart (e.g. multipart/alternative, multipart/related)
       for (const part of payload.parts) {
         if (part.mimeType.startsWith('multipart/')) {
           const content = getBody(part);
           if (content) return content;
         }
       }
+
+      // 3. Last resort: HTML fallback, stripped to plain text
+      for (const part of payload.parts) {
+        if (part.mimeType === 'text/html') {
+          const content = getBody(part);
+          if (content) return content;
+        }
+      }
     }
-    
+
     return '';
   };
   

@@ -38,3 +38,24 @@ Open `http://localhost:5173` in your browser.
 - Data Management: **Zustand**
 - Icons: **Lucide React**
 - Auth: **Google Identity Services (Gmail API)**
+
+## Deployment
+Deployed on **Vercel**. Every push to the `main` branch triggers an automatic redeploy. Ensure your Vercel project has the following environment variables configured:
+- `VITE_GROQ_API_KEY`
+- `VITE_GMAIL_CLIENT_ID`
+
+> **Note:** After deploying, update the **Authorized JavaScript Origins** and **Authorized Redirect URIs** in your Google Cloud Console OAuth 2.0 client to include your Vercel deployment URL.
+
+## Changelog
+
+### v1.2.0 — 2026-03-24
+- **Fix: Raw CSS appearing in email bodies** — Rewrote `emailParser.ts` body extraction logic to correctly detect `text/html` MIME type at every recursion level and strip all `<style>`, `<script>`, and HTML tags before passing content to the AI. Also added proper HTML entity decoding (`&nbsp;`, `&amp;`, `&lt;`, `&gt;`, `&quot;`).
+- **Fix: Multipart email recursion order** — The parser now correctly prioritises `text/plain` → `multipart/*` nesting → `text/html` fallback, preventing raw HTML from leaking into responses for complex MIME structures.
+
+### v1.1.0 — 2026-03-22
+- Rebuilt AI architecture with 5-Phase `Think → Fetch → Read → Reason → Respond` pipeline.
+- Added ChatGPT-style collapsible conversation sidebar with chronological grouping.
+- Dynamic response components: Key Findings tables, ⚡ Action Items, Follow-Up Prompt Chips.
+
+### v1.0.0 — 2026-03-15
+- Initial release: Gmail OAuth, email fetching, Groq-powered AI chat dashboard.
